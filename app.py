@@ -16,7 +16,11 @@ import streamlit as st
 
 APP_NAME = "蚂蚁经营助手"
 BASE_DIR = Path(__file__).resolve().parent
-HERO_IMAGE = BASE_DIR / "assets" / "hero-business-data-clean.png"
+HERO_IMAGES = [
+    BASE_DIR / "assets" / "hero-business-data-clean.png",
+    BASE_DIR / "assets" / "hero-business-data.png",
+    BASE_DIR / "assets" / "图片1.png",
+]
 
 st.set_page_config(
     page_title=APP_NAME,
@@ -857,8 +861,9 @@ def app_header() -> None:
     else:
         hero_title = f"{d.period}订单需要关注"
         hero_note = f"订单较基线 {fmt_pct(d.order_delta)}，建议先看诊断再决定动作。"
-    hero_modified = HERO_IMAGE.stat().st_mtime if HERO_IMAGE.exists() else 0.0
-    hero_src = image_data_uri(str(HERO_IMAGE), hero_modified)
+    hero_image = next((path for path in HERO_IMAGES if path.exists()), None)
+    hero_modified = hero_image.stat().st_mtime if hero_image else 0.0
+    hero_src = image_data_uri(str(hero_image), hero_modified) if hero_image else None
     if hero_src:
         hero_visual = f"""
           <div class="hero-image-card">
