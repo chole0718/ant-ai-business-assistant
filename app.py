@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import time
@@ -98,6 +99,7 @@ class Diagnosis:
     coupon_delta: float
     confidence: int
     reasons: list[dict]
+    period_overview: list[dict]
     scenario_name: str
 
 
@@ -112,6 +114,11 @@ def init_state() -> None:
         "executed": False,
         "chat": [],
         "ai_provider": AI_PROVIDERS[0],
+        "merchant_name": "小满餐饮",
+        "data_source": "样例场景",
+        "data_start": None,
+        "data_end": None,
+        "data_rows": 0,
         "plan": {
             "goal": "拉新",
             "threshold": 35,
@@ -300,6 +307,29 @@ def css() -> None:
           border-color: #1677ff;
           color: #fff;
         }
+        .data-context {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          min-height: 34px;
+          margin: -2px 0 10px;
+          padding: 7px 10px;
+          border: 1px solid #dbe6f3;
+          border-radius: 9px;
+          background: rgba(255, 255, 255, .72);
+          color: #667085;
+          font-size: 11px;
+          line-height: 1.35;
+        }
+        .data-context strong {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          color: #111827;
+          font-size: 12px;
+        }
+        .data-context .dot { color: #b8c5d6; }
         .section-title {
           margin: 4px 0 10px;
           font-size: 15px;
@@ -399,6 +429,62 @@ def css() -> None:
           font-weight: 700;
           line-height: 1.2;
         }
+        .period-overview {
+          margin: 2px 0 14px;
+          padding: 12px;
+          border: 1px solid #dbe6f3;
+          border-radius: 10px;
+          background: rgba(255, 255, 255, .78);
+        }
+        .period-overview-head {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 10px;
+          margin-bottom: 9px;
+        }
+        .period-overview-title {
+          color: #111827;
+          font-size: 13px;
+          font-weight: 800;
+        }
+        .period-overview-note {
+          color: #8a94a6;
+          font-size: 10px;
+          white-space: nowrap;
+        }
+        .period-list {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 7px;
+        }
+        .period-item {
+          min-width: 0;
+          padding: 8px 7px;
+          border: 1px solid #e2eaf4;
+          border-radius: 8px;
+          background: #f8fbff;
+          text-align: center;
+        }
+        .period-item.primary {
+          border-color: #91caff;
+          background: #eef6ff;
+          box-shadow: inset 0 0 0 1px rgba(22, 119, 255, .08);
+        }
+        .period-name {
+          color: #667085;
+          font-size: 11px;
+          font-weight: 700;
+        }
+        .period-value {
+          margin-top: 3px;
+          font-size: 14px;
+          font-weight: 800;
+          line-height: 1.2;
+        }
+        .period-value.down { color: #ef3340; }
+        .period-value.up { color: #00875a; }
+        .period-value.steady { color: #667085; }
         .reason-card {
           margin-top: 4px;
         }
@@ -550,6 +636,8 @@ def css() -> None:
           .big-title { font-size: 24px; }
           .metric-grid { gap: 8px; }
           .metric .value { font-size: 16px; }
+          .period-overview-note { display: none; }
+          .data-context { gap: 5px; padding-left: 9px; padding-right: 9px; }
         }
         </style>
         """,
@@ -659,6 +747,27 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     return data.sort_values(["date", "period"])
 
 
+def safe_html_text(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def build_data_context(df: pd.DataFrame, source_name: str) -> dict:
+    data = prepare_data(df)
+    merchant_name = "小满餐饮"
+    if "merchant_name" in data.columns:
+        names = data["merchant_name"].dropna().astype(str).str.strip()
+        names = names[names.ne("")]
+        if not names.empty:
+            merchant_name = names.iloc[0]
+    return {
+        "merchant_name": merchant_name,
+        "data_source": source_name,
+        "data_start": data["date"].min().strftime("%Y-%m-%d"),
+        "data_end": data["date"].max().strftime("%Y-%m-%d"),
+        "data_rows": len(data),
+    }
+
+
 def pct(now: float, base: float) -> float:
     if base == 0:
         return 0.0
@@ -683,7 +792,9 @@ def analyze(df: pd.DataFrame, scenario_name: str = "自定义数据") -> Diagnos
     baseline = data[(data["date"] >= base_start) & (data["date"] <= base_end)]
 
     candidates = []
-    for period in sorted(data["period"].unique()):
+    period_order = {name: index for index, name in enumerate(PERIOD_TIME)}
+    periods = sorted(data["period"].unique(), key=lambda name: (period_order.get(name, 99), name))
+    for period in periods:
         c = current[current["period"] == period]
         b = baseline[baseline["period"] == period]
         if c.empty or b.empty:
@@ -692,11 +803,33 @@ def analyze(df: pd.DataFrame, scenario_name: str = "自定义数据") -> Diagnos
         b_days = max(b["date"].nunique(), 1)
         orders_now = c["orders"].sum() / c_days
         orders_base = b["orders"].sum() / b_days
-        candidates.append((pct(orders_now, orders_base), period, c, b))
+        candidates.append(
+            {
+                "order_delta": pct(orders_now, orders_base),
+                "period": period,
+                "current": c,
+                "baseline": b,
+                "orders_now": round(orders_now),
+                "orders_base": round(orders_base),
+            }
+        )
     if not candidates:
         raise ValueError("数据不足，无法形成同经营时段对比。")
 
-    _, period, c, b = min(candidates, key=lambda item: item[0])
+    primary = min(candidates, key=lambda item: item["order_delta"])
+    period = primary["period"]
+    c = primary["current"]
+    b = primary["baseline"]
+    period_overview = [
+        {
+            "period": item["period"],
+            "orders_now": item["orders_now"],
+            "orders_base": item["orders_base"],
+            "order_delta": item["order_delta"],
+            "is_primary": item["period"] == period,
+        }
+        for item in candidates
+    ]
     current_days = max(c["date"].nunique(), 1)
     baseline_days = max(b["date"].nunique(), 1)
 
@@ -772,6 +905,7 @@ def analyze(df: pd.DataFrame, scenario_name: str = "自定义数据") -> Diagnos
         coupon_delta=coupon_delta,
         confidence=confidence,
         reasons=reasons,
+        period_overview=period_overview,
         scenario_name=scenario_name,
     )
 
@@ -779,6 +913,7 @@ def analyze(df: pd.DataFrame, scenario_name: str = "自定义数据") -> Diagnos
 def seed_plan(d: Diagnosis) -> dict:
     period_time = PERIOD_TIME.get(d.period, "11:00-14:00")
     top_reason = max(d.reasons, key=lambda item: item["weight"])["name"]
+    merchant_name = str(st.session_state.get("merchant_name", "小满餐饮")).strip() or "小满餐饮"
     if "新客" in top_reason:
         plan = {
             "goal": "拉新",
@@ -786,7 +921,7 @@ def seed_plan(d: Diagnosis) -> dict:
             "discount": 6,
             "budget": 1000,
             "audience": "近 30 天浏览未下单新客",
-            "copy": f"{d.period}来小满餐饮，满 35 元减 6 元。今日 {period_time} 可用。",
+            "copy": f"{d.period}来{merchant_name}，满 35 元减 6 元。今日 {period_time} 可用。",
         }
     elif "履约" in top_reason or "评价" in top_reason:
         plan = {
@@ -795,7 +930,7 @@ def seed_plan(d: Diagnosis) -> dict:
             "discount": 8,
             "budget": 900,
             "audience": "近 30 天下单但未复购顾客",
-            "copy": f"{d.period}服务体验补偿券，满 45 元减 8 元，今日 {period_time} 可用。",
+            "copy": f"{merchant_name}{d.period}服务体验补偿券，满 45 元减 8 元，今日 {period_time} 可用。",
         }
     elif d.coupon_delta < -0.2:
         plan = {
@@ -804,7 +939,7 @@ def seed_plan(d: Diagnosis) -> dict:
             "discount": 5,
             "budget": 800,
             "audience": "近 7 天领券未核销用户",
-            "copy": f"{d.period}限时提醒：满 30 元减 5 元，今天 {period_time} 可用。",
+            "copy": f"{merchant_name}{d.period}限时提醒：满 30 元减 5 元，今天 {period_time} 可用。",
         }
     elif d.new_delta < -0.15:
         plan = {
@@ -813,7 +948,7 @@ def seed_plan(d: Diagnosis) -> dict:
             "discount": 6,
             "budget": 1000,
             "audience": "近 30 天浏览未下单新客",
-            "copy": f"{d.period}来小满餐饮，满 35 元减 6 元。今日 {period_time} 可用。",
+            "copy": f"{d.period}来{merchant_name}，满 35 元减 6 元。今日 {period_time} 可用。",
         }
     else:
         plan = {
@@ -822,7 +957,7 @@ def seed_plan(d: Diagnosis) -> dict:
             "discount": 8,
             "budget": 900,
             "audience": "近 60 天未复购老客",
-            "copy": f"{d.period}专属回访券，满 45 元减 8 元，限今天 {period_time} 使用。",
+            "copy": f"{merchant_name}{d.period}专属回访券，满 45 元减 8 元，限今天 {period_time} 使用。",
         }
     st.session_state.plan = plan
     return plan
@@ -855,6 +990,7 @@ def image_data_uri(path_value: str, modified: float) -> str | None:
 
 def app_header() -> None:
     d = st.session_state.get("diagnosis")
+    merchant_name = safe_html_text(st.session_state.get("merchant_name", "小满餐饮"))
     if d is None:
         hero_title = "午市新客有波动"
         hero_note = "先用样例看一遍，也可以接入自己的经营数据。"
@@ -881,7 +1017,7 @@ def app_header() -> None:
     else:
         hero_visual = f"""
           <div class="hero-card">
-            <div class="eyebrow">早上好，小满餐饮</div>
+            <div class="eyebrow">早上好，{merchant_name}</div>
             <h1>{hero_title}</h1>
             <div class="hero-note">{hero_note}</div>
             <div class="hero-mini">
@@ -899,6 +1035,58 @@ def app_header() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_data_context() -> None:
+    if st.session_state.get("df") is None:
+        return
+    merchant_name = safe_html_text(st.session_state.get("merchant_name", "小满餐饮"))
+    start = str(st.session_state.get("data_start") or "")
+    end = str(st.session_state.get("data_end") or "")
+    if start[:4] == end[:4] and len(end) >= 10:
+        date_range = f"{start}—{end[5:]}"
+    else:
+        date_range = f"{start}—{end}".strip("—")
+    rows = int(st.session_state.get("data_rows") or 0)
+    st.markdown(
+        f"""
+        <div class="data-context">
+          <strong>{merchant_name}</strong>
+          <span class="dot">·</span>
+          <span>{safe_html_text(date_range)}</span>
+          <span class="dot">·</span>
+          <span>{rows} 条记录</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_period_overview_html(d: Diagnosis) -> str:
+    items = []
+    for item in d.period_overview:
+        delta = item["order_delta"]
+        trend = "down" if delta < -0.001 else "up" if delta > 0.001 else "steady"
+        primary = " primary" if item["is_primary"] else ""
+        items.append(
+            f'<div class="period-item{primary}">'
+            f'<div class="period-name">{safe_html_text(item["period"])}</div>'
+            f'<div class="period-value {trend}">{fmt_pct(delta)}</div>'
+            "</div>"
+        )
+    return (
+        '<div class="period-overview">'
+        '<div class="period-overview-head">'
+        '<span class="period-overview-title">三时段订单概览</span>'
+        '<span class="period-overview-note">最近 3 天对比此前 7 天同经营时段</span>'
+        "</div>"
+        f'<div class="period-list">{"".join(items)}</div>'
+        "</div>"
+    )
+
+
+def render_period_overview(d: Diagnosis) -> None:
+    st.html(build_period_overview_html(d))
 
 
 def metric_grid(d: Diagnosis) -> None:
@@ -923,6 +1111,8 @@ def metric_grid(d: Diagnosis) -> None:
 def load_scenario(name: str) -> None:
     df = scenario_data(name)
     st.session_state.df = df
+    for key, value in build_data_context(df, "样例场景").items():
+        st.session_state[key] = value
     st.session_state.scenario = name
     st.session_state.diagnosis = analyze(df, name)
     st.session_state.confirmed = False
@@ -933,6 +1123,8 @@ def load_scenario(name: str) -> None:
 
 def load_custom_data(raw: pd.DataFrame, source_name: str) -> None:
     st.session_state.df = prepare_data(raw)
+    for key, value in build_data_context(st.session_state.df, source_name).items():
+        st.session_state[key] = value
     st.session_state.scenario = source_name
     st.session_state.diagnosis = analyze(st.session_state.df, source_name)
     st.session_state.confirmed = False
@@ -982,7 +1174,7 @@ def home_page() -> None:
                 if not ok:
                     st.error(message)
                 else:
-                    load_custom_data(raw, "上传数据")
+                    load_custom_data(raw, uploaded.name)
                     st.rerun()
             except Exception:
                 st.error("CSV 无法读取，请检查文件格式。")
@@ -1037,6 +1229,7 @@ def report_page() -> None:
     )
     metric_grid(d)
     st.markdown("</div>", unsafe_allow_html=True)
+    render_period_overview(d)
 
     evidence_tags = "".join(f"<span class='tag'>{r['name']}</span>" for r in d.reasons)
     st.markdown(
@@ -1142,6 +1335,7 @@ def diagnosis_page() -> None:
         unsafe_allow_html=True,
     )
     metric_grid(d)
+    render_period_overview(d)
 
     reasons_html = "<div class='card reason-card'><div class='card-title'>可能原因</div>"
     for reason in d.reasons:
@@ -1306,6 +1500,8 @@ def main() -> None:
     st.markdown("<div class='app-shell'>", unsafe_allow_html=True)
     app_header()
     flow()
+    if st.session_state.step != "home":
+        render_data_context()
     st.markdown("</div>", unsafe_allow_html=True)
 
     if st.session_state.step == "home":
